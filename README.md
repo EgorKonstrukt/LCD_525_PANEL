@@ -3,10 +3,10 @@
 > [Русская версия](README.ru.md)
 
 PC status monitor based on an Arduino (WAVGAT UNO clone, LGT8F) and a 1602
-LCD display (16x2, I2C). The Windows application (Python, built with Nuitka)
-polls the system, displays the data on the LCD, controls the buzzer and LED,
-and alerts when USB devices are connected/disconnected or when error windows
-appear.
+LCD display (16x2, I2C). The cross-platform application (Windows and Linux,
+Python, built with Nuitka) polls the system, displays the data on the LCD,
+controls the buzzer and LED, and alerts when USB devices are connected/
+disconnected or when error windows appear.
 ![img.jpg](img.jpg)
 ## Features
 
@@ -14,19 +14,22 @@ appear.
   - CPU load, CPU frequency;
   - used RAM;
   - GPU load (nvidia-smi), temperature, frequency;
-  - CPU temperature (LibreHardwareMonitor / OpenHardwareMonitor).
+  - CPU temperature (Windows: LibreHardwareMonitor/OpenHardwareMonitor;
+    Linux: hwmon sysfs or lm-sensors).
 - **Boot animation** — the title "LCD525 PANEL" types out character by
   character, a progress bar, then transition to the normal mode.
 - **Spinner** — bitmap wheel animation (8 custom CGRAM characters) in the
   bottom-right corner, updated every 350 ms.
 - **Sound alerts:**
-  - errors/warnings detected from Windows window titles;
-  - USB device connect/disconnect;
+  - errors/warnings detected from window titles (Windows: Win32 API;
+    Linux: X11 via python-xlib or xdotool);
+  - USB device connect/disconnect (Windows: SetupAPI; Linux: /sys/bus/usb);
   - PC link up/link down;
   - 9 patterns: `short`, `long`, `double`, `triple`, `rapid`, `chime_up`,
     `chime_down`, `siren`, `wake`.
 - **LED** (pin 13): PWM "load" proportional to CPU load and blink on alert.
-- **Windows autostart**, tray icon, GUI settings.
+- **Autostart**, tray icon, GUI settings (Windows: registry; Linux: XDG
+  autostart `.desktop`).
 
 ## Hardware
 
@@ -73,9 +76,60 @@ python build.py
 
 Build requirements: Python 3.11+, Nuitka, a C compiler (MSVC).
 
-Dependencies: `psutil`, `pystray`, `PIL` (Pillow), `pyserial`.
+### Linux application
 
-Settings are stored in `%APPDATA%\LCD525Panel\config.json` (logs in `app.log`).
+`build.py` detects the platform and builds/installs the binary to
+`~/.local/bin/LCD525Panel` (autostart and menu entries are created under
+`~/.config/autostart/` and `~/.local/share/applications/`):
+
+```
+python3 build.py
+```
+
+Runtime dependencies (Debian/Ubuntu):
+
+```
+sudo apt install python3 python3-tk python3-pil python3-serial python3-psutil
+pip3 install pystray python-xlib
+```
+
+For window-title alerts an X11 server is used (via `python-xlib`; `xdotool`
+is a fallback). Under pure Wayland the tray and window monitoring are limited;
+the app still runs headless with system polling, LCD and USB alerts.
+
+### Firmware
+
+On Windows build and flash the Arduino firmware with `flash.bat` / `flash.ps1`:
+
+```
+flash.bat -Board uno            # Arduino Uno, auto port
+flash.bat -Board lgt8f -Port COM13
+flash.bat -Board mega -Programmer usbasp
+```
+
+On Linux use `flash.sh`:
+
+```
+./flash.sh -Board uno           # Arduino Uno, auto port
+./flash.sh -Board lgt8f -Port /dev/ttyUSB0
+./flash.sh -Board uno -BuildOnly   # build only
+```
+
+Linux toolchains: system packages (`gcc-avr`, `avrdude`) or the Arduino IDE
+toolchain in `~/.arduino15/packages/`. Cores: standard Arduino
+(`~/.arduino15/packages/arduino/hardware/avr/` or
+`/usr/share/arduino/hardware/arduino/avr`) and WAVGAT LGT8F
+(`~/.arduino15/packages/wavgat/hardware/avr/`). The `LiquidCrystal_I2C`
+library is expected in `~/Arduino/libraries/`.
+
+### Dependencies
+
+`psutil`, `pystray`, `PIL` (Pillow), `pyserial`; on Linux also `python-xlib`.
+
+### Settings
+
+Windows: `%APPDATA%\LCD525Panel\config.json` (log in `app.log`).
+Linux: `~/.config/LCD525Panel/config.json` (or `$XDG_CONFIG_HOME`).
 
 
 ## Settings
@@ -94,7 +148,10 @@ The tray menu also provides: status, reconnect, autostart, settings folder.
 
 ```
 AVR/AVR.ino      Arduino firmware
-main.py          Windows application (system polling, LCD, sound)
-build.py         .exe build (Nuitka onefile)
+main.py          cross-platform application (system polling, LCD, sound)
+build.py         build script (Nuitka onefile; Windows .exe / Linux binary)
+flash.ps1        Windows firmware build+flash script
+flash.bat        Windows wrapper for flash.ps1
+flash.sh         Linux firmware build+flash script
 3D_models/       case STL models
 ```

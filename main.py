@@ -1,5 +1,6 @@
 import ctypes
 import ctypes.wintypes
+import glob
 import json
 import os
 import re
@@ -16,11 +17,29 @@ import serial.tools.list_ports
 from PIL import Image, ImageDraw
 
 APP_NAME = "LCD525Panel"
-APPDIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def _config_dir():
+    if IS_WINDOWS:
+        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, APP_NAME)
+
+
+APPDIR = _config_dir()
 CFG_PATH = os.path.join(APPDIR, "config.json")
 LOG_PATH = os.path.join(APPDIR, "app.log")
 
 GPU_BIN = shutil.which("nvidia-smi")
+
+
+def _subprocess_kw(**kw):
+    """Common subprocess kwargs; creationflags exists only on Windows."""
+    if IS_WINDOWS:
+        kw.setdefault("creationflags", 0x08000000)
+    return kw
 
 ERROR_KW = ("ошибк", "не удалось", "не удаетс", "сбой", "проблема")
 ERROR_EN = ("error", "exception", "fail", "fatal", "crash", "fault",
@@ -215,7 +234,7 @@ def read_gpu():
         p = subprocess.run(
             [GPU_BIN, "--query-gpu=utilization.gpu,temperature.gpu,clocks.sm",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=4, creationflags=0x08000000)
+            capture_output=True, text=True, timeout=4, **_subprocess_kw())
         lines = (p.stdout or "").strip().splitlines()
         if not lines:
             return None, None, None
@@ -232,6 +251,12 @@ def read_gpu():
 
 
 def read_cpu_temp():
+    if IS_WINDOWS:
+        return _read_cpu_temp_win()
+    return _read_cpu_temp_linux()
+
+
+def _read_cpu_temp_win():
     for ns in ("root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor"):
         try:
             script = (
@@ -243,7 +268,7 @@ def read_cpu_temp():
             )
             p = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True, text=True, timeout=6, creationflags=0x08000000)
+                capture_output=True, text=True, timeout=6, **_subprocess_kw())
             text = (p.stdout or "").strip()
             if text:
                 v = float(text)
@@ -251,6 +276,54 @@ def read_cpu_temp():
                     return v
         except Exception:
             continue
+    return None
+
+
+def _read_cpu_temp_linux():
+    cpu_drivers = ("coretemp", "k10temp", "zenpower", "k8temp", "cpu_thermal",
+                   "cpu-thermal", "soc_thermal", "cpu")
+    vals = []
+    try:
+        for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            hwname = ""
+            try:
+                with open(os.path.join(hw, "name")) as f:
+                    hwname = f.read().strip().lower()
+            except Exception:
+                pass
+            is_cpu = hwname in cpu_drivers
+            for tfile in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+                try:
+                    with open(tfile) as f:
+                        v = float(f.read().strip()) / 1000.0
+                except Exception:
+                    continue
+                if v <= 0 or v > 110:
+                    continue
+                label = ""
+                try:
+                    with open(tfile[:-6] + "_label") as f:
+                        label = f.read().strip().lower()
+                except Exception:
+                    pass
+                if is_cpu or any(s in label for s in ("core", "tctl", "package",
+                                                      "tdie", "cpu")):
+                    vals.append(v)
+    except Exception:
+        pass
+    if vals:
+        return max(vals)
+    if shutil.which("sensors"):
+        try:
+            p = subprocess.run(["sensors", "-j"], capture_output=True,
+                               text=True, timeout=4, **_subprocess_kw())
+            text = (p.stdout or "")
+            if re.search(r'"(k10temp|coretemp|zenpower|cpu_thermal|k8temp)"', text):
+                m = re.findall(r"temp\d_input\s*:\s*([\d.]+)", text)
+                if m:
+                    return max(float(x) for x in m)
+        except Exception:
+            pass
     return None
 
 
@@ -356,8 +429,10 @@ def worker_loop():
         time.sleep(_state["interval"])
 
 
-_EnumWindowsProc = ctypes.WINFUNCTYPE(
-    ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+_EnumWindowsProc = None
+if IS_WINDOWS:
+    _EnumWindowsProc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
 
 def _init_user32():
@@ -381,7 +456,7 @@ def _init_user32():
     return u
 
 
-_init_user32()
+_WIN_USER32 = _init_user32() if IS_WINDOWS else None
 
 BENIGN_CLASSES = (
     "tooltips_class32", "#32768", "Shell_TrayWnd", "Progman", "Button",
@@ -395,32 +470,32 @@ def enum_windows():
     result = []
 
     def _cb(hwnd, lparam):
-        if ctypes.windll.user32.IsWindowVisible(hwnd):
+        if _WIN_USER32.IsWindowVisible(hwnd):
             result.append(hwnd)
         return True
 
-    ctypes.windll.user32.EnumWindows(_EnumWindowsProc(_cb), 0)
+    _WIN_USER32.EnumWindows(_EnumWindowsProc(_cb), 0)
     return result
 
 
 def win_title(hwnd):
-    n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+    n = _WIN_USER32.GetWindowTextLengthW(hwnd)
     if n <= 0:
         return ""
     buf = ctypes.create_unicode_buffer(n + 1)
-    ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
+    _WIN_USER32.GetWindowTextW(hwnd, buf, n + 1)
     return buf.value
 
 
 def win_class(hwnd):
     buf = ctypes.create_unicode_buffer(256)
-    ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
+    _WIN_USER32.GetClassNameW(hwnd, buf, 256)
     return buf.value
 
 
 def win_pid(hwnd):
     pid = ctypes.wintypes.DWORD()
-    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    _WIN_USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return pid.value
 
 
@@ -432,27 +507,33 @@ def match_en(low, words):
     return any(re.search(r"\b" + re.escape(w), low) for w in words)
 
 
-def classify(title, cls):
-    low = title.lower()
-    if match_kw(low, ERROR_KW) or match_en(low, ERROR_EN):
-        return "error"
-    if match_kw(low, WARNING_KW) or match_en(low, WARNING_EN):
-        return "warning"
-    if cls == "#32770":
-        return "info"
-    return None
-
-
 def is_dialog_like(hwnd, cls, title):
     if cls == "#32770" or cls.startswith("#"):
         return True
     if cls in BENIGN_CLASSES or not title.strip():
         return False
-    owner = ctypes.windll.user32.GetWindow(hwnd, 4)  # GW_OWNER
+    owner = _WIN_USER32.GetWindow(hwnd, 4)  # GW_OWNER
     if not owner:
         return False
-    style = ctypes.windll.user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
+    style = _WIN_USER32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
     return bool(style & 0x00C00000)  # WS_CAPTION (border or dialog frame)
+
+
+def classify_window(title, cls, is_dialog, wtype=""):
+    if not title or not title.strip():
+        return None
+    if wtype:
+        up = wtype.upper()
+        if any(t in up for t in ("DESKTOP", "DOCK", "SPLASH")):
+            return None
+    low = title.lower()
+    if match_kw(low, ERROR_KW) or match_en(low, ERROR_EN):
+        return "error"
+    if match_kw(low, WARNING_KW) or match_en(low, WARNING_EN):
+        return "warning"
+    if is_dialog:
+        return "info"
+    return None
 
 
 def send_alert(pattern, use_led):
@@ -462,8 +543,162 @@ def send_alert(pattern, use_led):
         send_line("B:" + pattern)
 
 
+_LINUX_WIN_BACKEND = None
+
+
+def _detect_linux_window_backend():
+    global _LINUX_WIN_BACKEND
+    if _LINUX_WIN_BACKEND is not None:
+        return _LINUX_WIN_BACKEND
+    try:
+        from Xlib import display  # noqa: F401
+        _LINUX_WIN_BACKEND = "xlib"
+    except Exception:
+        _LINUX_WIN_BACKEND = "xdotool" if shutil.which("xdotool") else None
+    return _LINUX_WIN_BACKEND
+
+
+def _xlib_list_windows():
+    try:
+        from Xlib import X, display
+    except Exception:
+        return []
+    try:
+        d = display.Display()
+    except Exception:
+        return []
+    res = []
+    try:
+        root = d.screen().root
+        atom_wname = d.intern_atom("_NET_WM_NAME")
+        atom_wmclass = d.intern_atom("WM_CLASS")
+        atom_wtype = d.intern_atom("_NET_WM_WINDOW_TYPE")
+        atom_pid = d.intern_atom("_NET_WM_PID")
+
+        def _prop_text(prop):
+            if not prop:
+                return ""
+            v = prop.value
+            if isinstance(v, bytes):
+                return v.decode("utf-8", "replace")
+            return ""
+
+        def walk(w):
+            try:
+                children = w.query_tree().children
+            except Exception:
+                children = []
+            for c in children:
+                try:
+                    attrs = c.get_attributes()
+                except Exception:
+                    attrs = None
+                if attrs is not None and attrs.map_state == X.IsViewable:
+                    title = ""
+                    try:
+                        title = _prop_text(c.get_property(atom_wname, "UTF8_STRING", 0, 512))
+                    except Exception:
+                        pass
+                    if not title:
+                        try:
+                            title = c.get_wm_name() or ""
+                        except Exception:
+                            title = ""
+                    cls = ""
+                    try:
+                        cls = _prop_text(c.get_property(atom_wmclass, X.STRING, 0, 256))
+                    except Exception:
+                        pass
+                    wtype = ""
+                    try:
+                        prop = c.get_property(atom_wtype, X.ATOM, 0, 16)
+                        if prop and prop.value:
+                            wtype = " ".join(
+                                str(d.get_atom_name(a)) for a in prop.value
+                                if isinstance(a, int))
+                    except Exception:
+                        pass
+                    pid = None
+                    try:
+                        prop = c.get_property(atom_pid, X.CARDINAL, 0, 8)
+                        if prop and prop.value:
+                            pid = int(prop.value[0])
+                    except Exception:
+                        pass
+                    res.append({
+                        "id": int(c.id), "pid": pid, "title": title,
+                        "cls": cls,
+                        "dialog": any(t in wtype.upper() for t in ("DIALOG", "NOTIFICATION")),
+                        "wtype": wtype,
+                    })
+                walk(c)
+        walk(root)
+    except Exception:
+        pass
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
+    return res
+
+
+def _xdotool_list_windows():
+    res = []
+    try:
+        out = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "."],
+                             capture_output=True, text=True, timeout=5, **_subprocess_kw())
+        for wid in (out.stdout or "").split():
+            title = ""
+            cls = ""
+            try:
+                title = subprocess.run(["xdotool", "getwindowname", wid],
+                                       capture_output=True, text=True, timeout=3,
+                                       **_subprocess_kw()).stdout.strip()
+            except Exception:
+                pass
+            try:
+                cls = subprocess.run(["xdotool", "getwindowclassname", wid],
+                                     capture_output=True, text=True, timeout=3,
+                                     **_subprocess_kw()).stdout.strip()
+            except Exception:
+                pass
+            try:
+                wid_int = int(wid, 16) if wid.lower().startswith("0x") else int(wid)
+            except Exception:
+                wid_int = len(res)
+            res.append({"id": wid_int, "pid": None, "title": title,
+                        "cls": cls, "dialog": False, "wtype": ""})
+    except Exception:
+        pass
+    return res
+
+
+def _linux_list_windows():
+    backend = _detect_linux_window_backend()
+    if backend == "xlib":
+        return _xlib_list_windows()
+    if backend == "xdotool":
+        return _xdotool_list_windows()
+    return []
+
+
+def iter_windows():
+    if IS_WINDOWS:
+        for hwnd in enum_windows():
+            pid = win_pid(hwnd)
+            title = win_title(hwnd)
+            cls = win_class(hwnd)
+            yield {"id": hwnd, "pid": pid, "title": title, "cls": cls,
+                   "dialog": is_dialog_like(hwnd, cls, title), "wtype": ""}
+    else:
+        for w in _linux_list_windows():
+            yield w
+
+
 def alert_loop():
     prev = set()
+    warned = False
     while _state["running"]:
         try:
             buz = _state["buzzer"]
@@ -471,25 +706,26 @@ def alert_loop():
                 prev = set()
                 time.sleep(1.0)
                 continue
+            if not IS_WINDOWS and not warned:
+                if _detect_linux_window_backend() is None:
+                    log("window monitor: X11/xdotool not available, window alerts off")
+                warned = True
             own = _state["self_pid"]
-            cur = set()
-            for hwnd in enum_windows():
-                if win_pid(hwnd) == own:
+            cur = {}
+            for w in iter_windows():
+                if w.get("pid") == own:
                     continue
-                title = win_title(hwnd)
-                cls = win_class(hwnd)
-                kind = classify(title, cls)
-                if kind is None and is_dialog_like(hwnd, cls, title):
-                    kind = "info"
+                kind = classify_window(w.get("title", ""), w.get("cls", ""),
+                                       w.get("dialog", False), w.get("wtype", ""))
                 if kind is not None:
-                    cur.add((hwnd, kind))
-            new = cur - prev
+                    cur[w["id"]] = (kind, w.get("title", ""))
+            new = {k: v for k, v in cur.items() if k not in prev}
             if new:
                 now = time.time()
                 if now - _state["last_alert"] >= 2.0:
                     _state["last_alert"] = now
-                    hwnd, kind = min(new)
-                    title = win_title(hwnd)
+                    wid = min(new)
+                    kind, title = new[wid]
                     if kind == "error":
                         pattern = buz.get("error", "rapid")
                     elif kind == "warning":
@@ -499,17 +735,20 @@ def alert_loop():
                     log("alert %s: %s" % (kind, title))
                     if buz.get("enabled", True):
                         send_alert(pattern, buz.get("led", True))
-            prev = cur
+            prev = set(cur)
         except Exception as e:
             log("alert: %s" % e)
         time.sleep(0.5)
 
 
-class _SPDevInfoData(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.wintypes.DWORD),
-                ("ClassGuid", ctypes.wintypes.BYTE * 16),
-                ("DevInst", ctypes.wintypes.DWORD),
-                ("Reserved", ctypes.c_void_p)]
+if IS_WINDOWS:
+    class _SPDevInfoData(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.wintypes.DWORD),
+                    ("ClassGuid", ctypes.wintypes.BYTE * 16),
+                    ("DevInst", ctypes.wintypes.DWORD),
+                    ("Reserved", ctypes.c_void_p)]
+else:
+    _SPDevInfoData = None
 
 
 def _init_setupapi():
@@ -532,10 +771,12 @@ def _init_setupapi():
     return sa, cm
 
 
-_SA, _CM = _init_setupapi()
+_SA, _CM = _init_setupapi() if IS_WINDOWS else (None, None)
 
 
-def list_usb_device_ids():
+def _win_list_usb_device_ids():
+    if _SA is None:
+        return None
     h = _SA.SetupDiGetClassDevsW(
         None, None, None, 0x00000002 | 0x00000004)
     if not h or h == ctypes.c_void_p(-1).value:
@@ -557,6 +798,32 @@ def list_usb_device_ids():
     finally:
         _SA.SetupDiDestroyDeviceInfoList(h)
     return ids
+
+
+def _linux_list_usb_devices():
+    ids = set()
+    base = "/sys/bus/usb/devices"
+    try:
+        for name in os.listdir(base):
+            d = os.path.join(base, name)
+            try:
+                with open(os.path.join(d, "idVendor")) as f:
+                    vid = f.read().strip().lower()
+                with open(os.path.join(d, "idProduct")) as f:
+                    pid = f.read().strip().lower()
+            except Exception:
+                continue
+            if vid and pid and vid != "1d6b":  # 1d6b = Linux root hub
+                ids.add("%s:%s@%s" % (vid, pid, name))
+    except Exception:
+        return None
+    return ids
+
+
+def list_usb_device_ids():
+    if IS_WINDOWS:
+        return _win_list_usb_device_ids()
+    return _linux_list_usb_devices()
 
 
 def usb_monitor_loop():
@@ -597,32 +864,71 @@ def make_icon_image():
     return img
 
 
+def _autostart_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "autostart")
+
+
+def _app_command():
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return os.path.abspath(sys.argv[0])
+    return '"%s" "%s"' % (sys.executable, os.path.abspath(sys.argv[0]))
+
+
 def autostart_enabled():
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                            r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
-            winreg.QueryValueEx(k, APP_NAME)
-        return True
-    except Exception:
-        return False
+    if IS_WINDOWS:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+                winreg.QueryValueEx(k, APP_NAME)
+            return True
+        except Exception:
+            return False
+    return os.path.exists(os.path.join(_autostart_dir(), APP_NAME + ".desktop"))
 
 
 def set_autostart(enabled):
-    import winreg
-    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                         r"Software\Microsoft\Windows\CurrentVersion\Run",
-                         0, winreg.KEY_SET_VALUE)
-    try:
-        if enabled:
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, '"%s"' % sys.executable)
-        else:
-            try:
-                winreg.DeleteValue(key, APP_NAME)
-            except FileNotFoundError:
-                pass
-    finally:
-        winreg.CloseKey(key)
+    if IS_WINDOWS:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run",
+                             0, winreg.KEY_SET_VALUE)
+        try:
+            if enabled:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, '"%s"' % sys.executable)
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+        return
+    d = _autostart_dir()
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, APP_NAME + ".desktop")
+    if enabled:
+        content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=%s\n"
+            "Comment=LCD525 Panel monitor\n"
+            "Exec=%s\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+            "Hidden=false\n" % (APP_NAME, _app_command())
+        )
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            log("set_autostart: %s" % e)
+    else:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def toggle_autostart(icon, item):
@@ -653,9 +959,16 @@ def show_status(icon, item):
 def open_folder(icon=None, item=None):
     try:
         os.makedirs(APPDIR, exist_ok=True)
-        os.startfile(APPDIR)
+        if IS_WINDOWS:
+            os.startfile(APPDIR)
+        else:
+            subprocess.Popen(["xdg-open", APPDIR],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         log("open_folder: %s" % e)
+
+
+_LOCK_PATH = None
 
 
 def shutdown(icon=None, item=None):
@@ -665,6 +978,12 @@ def shutdown(icon=None, item=None):
         try:
             s.close()
         except Exception:
+            pass
+    global _LOCK_PATH
+    if _LOCK_PATH:
+        try:
+            os.remove(_LOCK_PATH)
+        except OSError:
             pass
     if icon is not None:
         icon.stop()
@@ -695,7 +1014,7 @@ def _settings_thread():
     ports = [p.device for p in serial.tools.list_ports.comports()]
     var_port = tk.StringVar(value=_state["com_port"] or "auto")
     var_int = tk.StringVar(value=str(_state["interval"]))
-    tk.Label(f1, text="COM port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+    tk.Label(f1, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
     ttk.Combobox(f1, textvariable=var_port, values=["auto"] + ports,
                  width=16, state="readonly").grid(row=0, column=1, padx=4, pady=4)
     tk.Label(f1, text="Update interval (s):").grid(row=1, column=0, sticky="w", padx=4, pady=4)
@@ -885,13 +1204,42 @@ def _settings_thread():
 
 
 def _single_instance():
+    global _LOCK_PATH
+    if IS_WINDOWS:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+            handle = kernel32.CreateMutexW(None, False, "Local\\" + APP_NAME)
+            if kernel32.GetLastError() == 183:
+                return None
+            return handle
+        except Exception:
+            return True
+    lock = os.path.join(APPDIR, APP_NAME + ".lock")
     try:
-        kernel32 = ctypes.windll.kernel32
-        kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
-        handle = kernel32.CreateMutexW(None, False, "Local\\" + APP_NAME)
-        if kernel32.GetLastError() == 183:
+        os.makedirs(APPDIR, exist_ok=True)
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        os.close(fd)
+        _LOCK_PATH = lock
+        return lock
+    except FileExistsError:
+        try:
+            with open(lock) as f:
+                old = int(f.read().strip() or "0")
+            if old > 0:
+                try:
+                    os.kill(old, 0)
+                    return None
+                except ProcessLookupError:
+                    pass
+        except (ValueError, OSError, IOError):
+            pass
+        try:
+            os.remove(lock)
+        except OSError:
             return None
-        return handle
+        return _single_instance()
     except Exception:
         return True
 
@@ -945,7 +1293,12 @@ def main():
     )
 
     icon = pystray.Icon(APP_NAME, make_icon_image(), "LCD525 Panel", menu)
-    icon.run()
+    try:
+        icon.run()
+    except Exception as e:
+        log("tray backend unavailable, running headless: %s" % e)
+        while _state["running"]:
+            time.sleep(1.0)
 
 
 if __name__ == "__main__":

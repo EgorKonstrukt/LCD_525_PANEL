@@ -3,10 +3,10 @@
 > [English version](README.md)
 
 Монитор состояния ПК на базе Arduino (клона WAVGAT UNO, LGT8F) и LCD-дисплея
-1602 (16×2, I2C). Программа на Windows (Python, собрана Nuitka) опрашивает
-систему, выводит данные на дисплей, управляет пищалкой и светодиодом, а также
-сигнализирует о подключении/отключении USB-устройств и о появлении окон с
-ошибками.
+1602 (16×2, I2C). Кроссплатформенное приложение (Windows и Linux, Python,
+собрано Nuitka) опрашивает систему, выводит данные на дисплей, управляет
+пищалкой и светодиодом, а также сигнализирует о подключении/отключении
+USB-устройств и о появлении окон с ошибками.
 ![img.jpg](img.jpg)
 ## Возможности
 
@@ -14,19 +14,23 @@
   - загрузка CPU, частота CPU;
   - занятая RAM;
   - загрузка GPU (nvidia-smi), температура, частота;
-  - температура CPU (LibreHardwareMonitor / OpenHardwareMonitor).
+  - температура CPU (Windows: LibreHardwareMonitor / OpenHardwareMonitor;
+    Linux: hwmon sysfs или lm-sensors).
 - **Анимация запуска** — заголовок «LCD525 PANEL» набирается по буквам,
   прогресс-бар, затем переход в рабочий режим.
 - **Спиннер** — bitmap-анимация колеса (8 пользовательских символов CGRAM)
   в правом нижнем углу, обновление каждые 350 мс.
 - **Звуковая сигнализация:**
-  - ошибки/предупреждения по заголовкам окон Windows;
-  - подключение/отключение USB-устройств;
+  - ошибки/предупреждения по заголовкам окон (Windows: Win32 API;
+    Linux: X11 через python-xlib или xdotool);
+  - подключение/отключение USB-устройств (Windows: SetupAPI;
+    Linux: /sys/bus/usb);
   - установка/потеря связи с ПК;
   - 9 мелодий: `short`, `long`, `double`, `triple`, `rapid`, `chime_up`,
     `chime_down`, `siren`, `wake`.
 - **Светодиод** (пин 13): PWM-«нагрузка» по загрузке CPU и мигание при тревоге.
-- **Автозапуск** в Windows, иконка в трее, настройки через GUI.
+- **Автозапуск**, иконка в трее, настройки через GUI (Windows: реестр;
+  Linux: XDG autostart `.desktop`).
 
 ## Аппаратная часть
 
@@ -62,10 +66,10 @@
 
 ## Установка и запуск
 
-### Windows-приложение
+### Приложение для Windows
 
-Готовый файл `LCD525Panel.exe` собирается скриптом `build.py` и устанавливается
-в `%LOCALAPPDATA%\LCD525Panel\`:
+Готовый `LCD525Panel.exe` собирается `build.py` и устанавливается в
+`%LOCALAPPDATA%\LCD525Panel\`:
 
 ```
 python build.py
@@ -73,9 +77,61 @@ python build.py
 
 Требования для сборки: Python 3.11+, Nuitka, компилятор C (MSVC).
 
-Зависимости: `psutil`, `pystray`, `PIL` (Pillow), `pyserial`.
+### Приложение для Linux
 
-Настройки хранятся в `%APPDATA%\LCD525Panel\config.json` (логи — `app.log`).
+`build.py` сам определяет платформу: бинарник собирается и ставится в
+`~/.local/bin/LCD525Panel` (автозапуск и пункт меню создаются в
+`~/.config/autostart/` и `~/.local/share/applications/`):
+
+```
+python3 build.py
+```
+
+Зависимости (Debian/Ubuntu):
+
+```
+sudo apt install python3 python3-tk python3-pil python3-serial python3-psutil
+pip3 install pystray python-xlib
+```
+
+Для сигнализации по заголовкам окон нужен X11 (через `python-xlib`;
+запасной вариант — `xdotool`). Под чистым Wayland трей и мониторинг окон
+ограничены; приложение всё равно работает «headless»: опрос системы,
+LCD и сигнализация по USB работают.
+
+### Прошивка
+
+На Windows сборка и заливка прошивки Arduino — `flash.bat` / `flash.ps1`:
+
+```
+flash.bat -Board uno            # Arduino Uno, автопорт
+flash.bat -Board lgt8f -Port COM13
+flash.bat -Board mega -Programmer usbasp
+```
+
+На Linux — `flash.sh`:
+
+```
+./flash.sh -Board uno           # Arduino Uno, автопорт
+./flash.sh -Board lgt8f -Port /dev/ttyUSB0
+./flash.sh -Board uno -BuildOnly   # только собрать
+```
+
+Тулчейны на Linux: системные пакеты (`gcc-avr`, `avrdude`) или тулчейн
+Arduino IDE в `~/.arduino15/packages/`. Ядра: стандартное Arduino
+(`~/.arduino15/packages/arduino/hardware/avr/` или
+`/usr/share/arduino/hardware/arduino/avr`) и WAVGAT LGT8F
+(`~/.arduino15/packages/wavgat/hardware/avr/`). Библиотека
+`LiquidCrystal_I2C` ожидается в `~/Arduino/libraries/`.
+
+### Зависимости
+
+`psutil`, `pystray`, `PIL` (Pillow), `pyserial`; на Linux также `python-xlib`.
+
+### Настройки
+
+Windows: `%APPDATA%\LCD525Panel\config.json` (логи — `app.log`).
+Linux: `~/.config/LCD525Panel/config.json` (или `$XDG_CONFIG_HOME`).
 
 
 ## Настройки
@@ -95,7 +151,10 @@ python build.py
 
 ```
 AVR/AVR.ino      прошивка Arduino
-main.py          Windows-приложение (опрос системы, LCD, звук)
-build.py         сборка .exe (Nuitka onefile)
+main.py          кроссплатформенное приложение (опрос системы, LCD, звук)
+build.py         сборка (Nuitka onefile; .exe для Windows / бинарник для Linux)
+flash.ps1        сборка и заливка прошивки в Windows
+flash.bat        обёртка для flash.ps1
+flash.sh         сборка и заливка прошивки в Linux
 3D_models/       STL-модели корпуса
 ```
