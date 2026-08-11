@@ -1,101 +1,100 @@
 # LCD525 Panel
 
-> [English version](README.en.md)
+> [Русская версия](README.ru.md)
 
-Монитор состояния ПК на базе Arduino (клона WAVGAT UNO, LGT8F) и LCD-дисплея
-1602 (16×2, I2C). Программа на Windows (Python, собрана Nuitka) опрашивает
-систему, выводит данные на дисплей, управляет пищалкой и светодиодом, а также
-сигнализирует о подключении/отключении USB-устройств и о появлении окон с
-ошибками.
+PC status monitor based on an Arduino (WAVGAT UNO clone, LGT8F) and a 1602
+LCD display (16x2, I2C). The Windows application (Python, built with Nuitka)
+polls the system, displays the data on the LCD, controls the buzzer and LED,
+and alerts when USB devices are connected/disconnected or when error windows
+appear.
 ![img.jpg](img.jpg)
-## Возможности
+## Features
 
-- **Индикация на LCD 16×2:**
-  - загрузка CPU, частота CPU;
-  - занятая RAM;
-  - загрузка GPU (nvidia-smi), температура, частота;
-  - температура CPU (LibreHardwareMonitor / OpenHardwareMonitor).
-- **Анимация запуска** — заголовок «LCD525 PANEL» набирается по буквам,
-  прогресс-бар, затем переход в рабочий режим.
-- **Спиннер** — bitmap-анимация колеса (8 пользовательских символов CGRAM)
-  в правом нижнем углу, обновление каждые 350 мс.
-- **Звуковая сигнализация:**
-  - ошибки/предупреждения по заголовкам окон Windows;
-  - подключение/отключение USB-устройств;
-  - установка/потеря связи с ПК;
-  - 9 мелодий: `short`, `long`, `double`, `triple`, `rapid`, `chime_up`,
+- **16x2 LCD readout:**
+  - CPU load, CPU frequency;
+  - used RAM;
+  - GPU load (nvidia-smi), temperature, frequency;
+  - CPU temperature (LibreHardwareMonitor / OpenHardwareMonitor).
+- **Boot animation** — the title "LCD525 PANEL" types out character by
+  character, a progress bar, then transition to the normal mode.
+- **Spinner** — bitmap wheel animation (8 custom CGRAM characters) in the
+  bottom-right corner, updated every 350 ms.
+- **Sound alerts:**
+  - errors/warnings detected from Windows window titles;
+  - USB device connect/disconnect;
+  - PC link up/link down;
+  - 9 patterns: `short`, `long`, `double`, `triple`, `rapid`, `chime_up`,
     `chime_down`, `siren`, `wake`.
-- **Светодиод** (пин 13): PWM-«нагрузка» по загрузке CPU и мигание при тревоге.
-- **Автозапуск** в Windows, иконка в трее, настройки через GUI.
+- **LED** (pin 13): PWM "load" proportional to CPU load and blink on alert.
+- **Windows autostart**, tray icon, GUI settings.
 
-## Аппаратная часть
+## Hardware
 
-| Компонент | Пин/адрес |
+| Component | Pin/address |
 |---|---|
-| Arduino (клона UNO, LGT8F) | — |
-| LCD 1602 I2C | адрес `0x27`, SDA = A4, SCL = A5 |
-| Пищалка (buzzer) | пин **3** (по умолчанию, настраивается) |
-| Светодиод | пин **13** (встроенный) |
-| COM-порт | 9600 бод, строка заканчивается `\n` |
+| Arduino (UNO clone, LGT8F) | — |
+| LCD 1602 I2C | address `0x27`, SDA = A4, SCL = A5 |
+| Buzzer | pin **3** (default, configurable) |
+| LED | pin **13** (built-in) |
+| COM port | 9600 baud, newline-terminated commands |
 
-## Протокол
+## Protocol
 
-Пищалка может быть активной (`active`) или пассивной (`passive`). Для пассивной
-звук генерируется в прерывании TIMER1 (soft-PWM 32 кГц), частота и громкость
-настраиваются. Настройки сохраняются в EEPROM платы.
+The buzzer can be active or passive. For a passive buzzer the tone is generated
+in a TIMER1 interrupt (32 kHz soft-PWM); frequency and volume are configurable.
+Settings are stored in the board EEPROM.
 
-Команды от ПК к плате:
+Commands from the PC to the board:
 
-| Команда | Назначение |
+| Command | Purpose |
 |---|---|
-| `D:line1\|line2` | обновить текст на дисплее (16 и 15 символов) |
-| `A:pattern` | мелодия + мигание светодиода 2 с |
-| `B:pattern` | только мелодия |
-| `X:0-100` | скважность светодиода (PWM, цикл 500 мс) |
-| `P:2-13` | пин пищалки (сохраняется в EEPROM) |
-| `V:0-100` | громкость |
-| `F:100-10000` | частота пассивной пищалки, Гц |
-| `S:25-400` | скорость мелодии, % |
-| `T:passive\|active` | тип пищалки |
-| `L:on\|off` | вкл/выкл светодиода |
-| `Q:` | ответ `S:pin,passive,volume,freq,speed,beeping` |
+| `D:line1\|line2` | update display text (16 and 15 characters) |
+| `A:pattern` | pattern + 2 s LED blink |
+| `B:pattern` | pattern only |
+| `X:0-100` | LED duty (PWM, 500 ms cycle) |
+| `P:2-13` | buzzer pin (saved to EEPROM) |
+| `V:0-100` | volume |
+| `F:100-10000` | passive buzzer frequency, Hz |
+| `S:25-400` | pattern speed, % |
+| `T:passive\|active` | buzzer type |
+| `L:on\|off` | LED enable/disable |
+| `Q:` | reply `S:pin,passive,volume,freq,speed,beeping` |
 
-## Установка и запуск
+## Installation
 
-### Windows-приложение
+### Windows application
 
-Готовый файл `LCD525Panel.exe` собирается скриптом `build.py` и устанавливается
-в `%LOCALAPPDATA%\LCD525Panel\`:
+The ready `LCD525Panel.exe` is built by `build.py` and installed to
+`%LOCALAPPDATA%\LCD525Panel\`:
 
 ```
 python build.py
 ```
 
-Требования для сборки: Python 3.11+, Nuitka, компилятор C (MSVC).
+Build requirements: Python 3.11+, Nuitka, a C compiler (MSVC).
 
-Зависимости: `psutil`, `pystray`, `PIL` (Pillow), `pyserial`.
+Dependencies: `psutil`, `pystray`, `PIL` (Pillow), `pyserial`.
 
-Настройки хранятся в `%APPDATA%\LCD525Panel\config.json` (логи — `app.log`).
+Settings are stored in `%APPDATA%\LCD525Panel\config.json` (logs in `app.log`).
 
 
-## Настройки
+## Settings
 
-Окно настроек открывается из меню иконки в трее.
+The settings window opens from the tray icon menu.
 
-- **Connection** — COM-порт, интервал обновления.
-- **Notifications** — слежение за окнами ошибок/предупреждений, пищалка
-  (пин, тип, громкость, частота, скорость), паттерны для ошибок/предупреждений,
-  тестовые кнопки.
-- **Display** — какие параметры выводить на дисплей.
-- **USB** — звук при подключении/отключении USB-устройств.
+- **Connection** — COM port, update interval.
+- **Notifications** — error/warning window watching, buzzer (pin, type,
+  volume, frequency, speed), patterns for errors/warnings, test buttons.
+- **Display** — which parameters are shown on the LCD.
+- **USB** — sound on USB device connect/disconnect.
 
-Дополнительно в меню трея: статус, реконнект, автозапуск, папка с настройками.
+The tray menu also provides: status, reconnect, autostart, settings folder.
 
-## Структура проекта
+## Project structure
 
 ```
-AVR/AVR.ino      прошивка Arduino
-main.py          Windows-приложение (опрос системы, LCD, звук)
-build.py         сборка .exe (Nuitka onefile)
-3D_models/       STL-модели корпуса
+AVR/AVR.ino      Arduino firmware
+main.py          Windows application (system polling, LCD, sound)
+build.py         .exe build (Nuitka onefile)
+3D_models/       case STL models
 ```
