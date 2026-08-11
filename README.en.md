@@ -77,19 +77,6 @@ Dependencies: `psutil`, `pystray`, `PIL` (Pillow), `pyserial`.
 
 Settings are stored in `%APPDATA%\LCD525Panel\config.json` (logs in `app.log`).
 
-### Firmware
-
-The sketch is `AVR/AVR.ino` (Arduino IDE). For building outside the IDE a
-`build.bat` is used from the build directory (see
-`C:\Users\<user>\AppData\Local\Temp\opencode\avrbuild`), compiling with
-avr-gcc/avr-g++ and flashing via avrdude:
-
-```
-avrdude -patmega328p -carduino -PCOM10 -b57600 -D -Uflash:w:sketch.hex:i -V
-```
-
-Stop the application before flashing (otherwise the port is busy). Flashing
-reboots the board — the `wake` pattern plays and the boot animation runs.
 
 ## Settings
 

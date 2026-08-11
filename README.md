@@ -77,19 +77,6 @@ python build.py
 
 Настройки хранятся в `%APPDATA%\LCD525Panel\config.json` (логи — `app.log`).
 
-### Прошивка
-
-Скетч — `AVR/AVR.ino` (Arduino IDE). Для сборки вне IDE используется
-`build.bat` из рабочего каталога сборки (см. `C:\Users\<user>\AppData\Local\Temp\opencode\avrbuild`),
-компиляция через avr-gcc/avr-g++ с последующей заливкой через avrdude:
-
-```
-avrdude -patmega328p -carduino -PCOM10 -b57600 -D -Uflash:w:sketch.hex:i -V
-```
-
-Перед заливкой приложение нужно остановить (иначе порт занят). Заливка
-перезапускает плату — в этот момент проигрывается мелодия `wake` и идёт
-анимация запуска.
 
 ## Настройки
 
