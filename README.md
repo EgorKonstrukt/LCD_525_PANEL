@@ -15,7 +15,14 @@ disconnected or when error windows appear.
   - used RAM;
   - GPU load (nvidia-smi), temperature, frequency;
   - CPU temperature (Windows: LibreHardwareMonitor/OpenHardwareMonitor;
-    Linux: hwmon sysfs or lm-sensors).
+    Linux: hwmon sysfs or lm-sensors);
+  - LAN IP, number of running processes, network TX/RX speed.
+- **Multiple LCD pages** — the screen cycles through several configurable
+  pages with a per-page (or global) switch delay.
+- **Grid layout** — each field is a cell with a configurable label, column
+  and row (0-15, 0-1), so the LCD can be arranged like a table.
+- **Live LCD preview** — a 16x2 pixel-style preview at the bottom of every
+  settings tab, updated while editing.
 - **Boot animation** — the title "LCD525 PANEL" types out character by
   character, a progress bar, then transition to the normal mode.
 - **Spinner** — bitmap wheel animation (8 custom CGRAM characters) in the
@@ -25,8 +32,13 @@ disconnected or when error windows appear.
     Linux: X11 via python-xlib or xdotool);
   - USB device connect/disconnect (Windows: SetupAPI; Linux: /sys/bus/usb);
   - PC link up/link down;
-  - 9 patterns: `short`, `long`, `double`, `triple`, `rapid`, `chime_up`,
-    `chime_down`, `siren`, `wake`.
+  - `None`/`off` plays nothing;
+  - 20 patterns: `short`, `long`, `double`, `triple`, `rapid`, `chime_up`,
+    `chime_down`, `siren`, `wake`, `buzz`, `notification`, `success`, `sad`,
+    `alarm`, `rising`, `falling`, `doorbell`, `sos`, `fanfare`, `game_over`;
+  - ignored window titles (no alert/sound);
+  - SATA disk connect/disconnect (Windows: WMI `Win32_DiskDrive`, Linux:
+    `/sys/block` non-removable `sd*`/`hd*`).
 - **LED** (pin 13): PWM "load" proportional to CPU load and blink on alert.
 - **Autostart**, tray icon, GUI settings (Windows: registry; Linux: XDG
   autostart `.desktop`).
@@ -138,9 +150,15 @@ The settings window opens from the tray icon menu.
 
 - **Connection** — COM port, update interval.
 - **Notifications** — error/warning window watching, buzzer (pin, type,
-  volume, frequency, speed), patterns for errors/warnings, test buttons.
-- **Display** — which parameters are shown on the LCD.
+  volume, frequency, speed), patterns for errors/warnings, test buttons,
+  ignored window titles.
+- **Display** — multi-page editor: add/remove pages, set page name and
+  switch delay, add/remove fields (label, data key, column, row) for a grid
+  layout; the 16x2 preview is shown on every tab.
 - **USB** — sound on USB device connect/disconnect.
+- **Disks** — sound on SATA disk connect/disconnect.
+- **Delays** — polling intervals: GPU, CPU temperature, window monitor,
+  USB monitor, SATA disk monitor, reconnect retry, minimum time between alerts.
 
 The tray menu also provides: status, reconnect, autostart, settings folder.
 

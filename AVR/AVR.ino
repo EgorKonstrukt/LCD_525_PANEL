@@ -72,7 +72,7 @@ unsigned long lastSpinMillis = 0;
 
 String inputString = "";
 
-const int MAX_STEPS = 16;
+const int MAX_STEPS = 40;
 int beepDur[MAX_STEPS];
 int beepRatio[MAX_STEPS];
 int beepCount = 0;
@@ -424,6 +424,40 @@ void startBeep(String mode) {
   } else if (mode == "wake") {
     addStep(120, 1000); addStep(50, 0); addStep(120, 1122);
     addStep(50, 0); addStep(120, 1260); addStep(50, 0); addStep(180, 1498);
+  } else if (mode == "buzz") {
+    addStep(200, 500); addStep(80, 0); addStep(200, 500);
+  } else if (mode == "notification") {
+    addStep(120, 1260); addStep(60, 0); addStep(200, 1498);
+  } else if (mode == "success") {
+    addStep(100, 1000); addStep(40, 0); addStep(100, 1260);
+    addStep(40, 0); addStep(180, 1498);
+  } else if (mode == "sad") {
+    addStep(160, 1498); addStep(80, 0); addStep(160, 1260);
+    addStep(80, 0); addStep(160, 1000); addStep(300, 0);
+  } else if (mode == "alarm") {
+    for (int i = 0; i < 4; i++) {
+      addStep(90, 1498); addStep(90, 700);
+    }
+  } else if (mode == "rising") {
+    addStep(80, 1000); addStep(80, 1122); addStep(80, 1260);
+    addStep(80, 1335); addStep(120, 1498);
+  } else if (mode == "falling") {
+    addStep(80, 1498); addStep(80, 1335); addStep(80, 1260);
+    addStep(80, 1122); addStep(120, 1000);
+  } else if (mode == "doorbell") {
+    addStep(180, 1498); addStep(120, 0); addStep(220, 1122);
+  } else if (mode == "sos") {
+    for (int i = 0; i < 3; i++) { addStep(80, 1000); addStep(80, 0); }
+    addStep(240, 0);
+    for (int i = 0; i < 3; i++) { addStep(240, 1000); addStep(80, 0); }
+    addStep(240, 0);
+    for (int i = 0; i < 3; i++) { addStep(80, 1000); addStep(80, 0); }
+  } else if (mode == "fanfare") {
+    addStep(100, 1000); addStep(40, 0); addStep(100, 1260);
+    addStep(40, 0); addStep(100, 1498); addStep(40, 0); addStep(180, 1890);
+  } else if (mode == "game_over") {
+    addStep(200, 1498); addStep(100, 0); addStep(200, 1260);
+    addStep(100, 0); addStep(200, 1000); addStep(300, 0);
   } else {
     return;
   }

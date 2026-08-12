@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -62,13 +63,8 @@ DEFAULT_BUZZER = {
 }
 
 DEFAULT_DISPLAY = {
-    "cpu": True,
-    "cpu_freq": True,
-    "ram": True,
-    "gpu": True,
-    "gpu_temp": True,
-    "gpu_freq": True,
-    "cpu_temp": False,
+    "page_delay": 5.0,
+    "pages": [],
 }
 
 DEFAULT_USB = {
@@ -76,6 +72,31 @@ DEFAULT_USB = {
     "connect": "chime_up",
     "disconnect": "chime_down",
 }
+
+DEFAULT_DISKS = {
+    "sound": True,
+    "connect": "chime_up",
+    "disconnect": "chime_down",
+}
+
+DEFAULT_DELAYS = {
+    "gpu": 5.0,
+    "ctemp": 10.0,
+    "windows": 2.0,
+    "usb": 3.0,
+    "disks": 5.0,
+    "retry": 3.0,
+    "alert_min": 2.0,
+}
+
+NO_SOUND = ("off", "None")
+
+SOUND_PATTERNS = ["None", "off", "short", "long", "double", "triple", "rapid",
+                  "chime_up", "chime_down", "siren", "wake",
+                  "buzz", "notification", "success", "sad", "alarm",
+                  "rising", "falling", "doorbell", "sos", "fanfare",
+                  "game_over"]
+AUDIBLE_PATTERNS = [p for p in SOUND_PATTERNS if p not in NO_SOUND]
 
 _state = {
     "lock": threading.Lock(),
@@ -88,6 +109,10 @@ _state = {
     "gtemp": None,
     "gpu_freq": None,
     "ctemp": None,
+    "ip": None,
+    "procs": 0,
+    "net_tx": 0.0,
+    "net_rx": 0.0,
     "ser": None,
     "port": None,
     "connected": False,
@@ -98,6 +123,9 @@ _state = {
     "buzzer": dict(DEFAULT_BUZZER),
     "display": dict(DEFAULT_DISPLAY),
     "usb": dict(DEFAULT_USB),
+    "disks": dict(DEFAULT_DISKS),
+    "delays": dict(DEFAULT_DELAYS),
+    "ignored": [],
     "self_pid": os.getpid(),
     "last_alert": 0.0,
 }
@@ -115,7 +143,8 @@ def log(msg):
 def load_config():
     cfg = {"com_port": "", "interval": 1.0,
            "buzzer": dict(DEFAULT_BUZZER), "display": dict(DEFAULT_DISPLAY),
-           "usb": dict(DEFAULT_USB)}
+           "usb": dict(DEFAULT_USB), "disks": dict(DEFAULT_DISKS),
+           "delays": dict(DEFAULT_DELAYS), "ignored": []}
     try:
         with open(CFG_PATH, "r", encoding="utf-8") as f:
             stored = json.load(f)
@@ -133,6 +162,19 @@ def load_config():
             if isinstance(cfg.get("usb"), dict):
                 merged_usb.update(cfg["usb"])
             cfg["usb"] = merged_usb
+            merged_disks = dict(DEFAULT_DISKS)
+            if isinstance(cfg.get("disks"), dict):
+                merged_disks.update(cfg["disks"])
+            cfg["disks"] = merged_disks
+            merged_delays = dict(DEFAULT_DELAYS)
+            if isinstance(cfg.get("delays"), dict):
+                merged_delays.update({k: max(float(v), 0.1)
+                                      for k, v in cfg["delays"].items()
+                                      if isinstance(v, (int, float))})
+            cfg["delays"] = merged_delays
+            if not isinstance(cfg.get("ignored"), list):
+                cfg["ignored"] = []
+            cfg["ignored"] = [str(s).strip() for s in cfg["ignored"] if str(s).strip()]
     except Exception:
         pass
     return cfg
@@ -176,7 +218,7 @@ def try_connect():
     if _state["ser"] is not None and _state["ser"].is_open:
         return
     now = time.time()
-    if now - _state["last_try"] < 3.0:
+    if now - _state["last_try"] < _state["delays"]["retry"]:
         return
     _state["last_try"] = now
     port = find_arduino_port(_state["com_port"])
@@ -256,7 +298,32 @@ def read_cpu_temp():
     return _read_cpu_temp_linux()
 
 
+_last_hwmon_probe = 0.0
+_hwmon_avail = None
+
+
+def _hwmon_available():
+    global _last_hwmon_probe, _hwmon_avail
+    now = time.time()
+    if _hwmon_avail is not None and now - _last_hwmon_probe < 30.0:
+        return _hwmon_avail
+    _last_hwmon_probe = now
+    avail = False
+    try:
+        for p in psutil.process_iter(["name"]):
+            n = (p.info.get("name") or "").lower()
+            if "librehardwaremonitor" in n or "openhardwaremonitor" in n:
+                avail = True
+                break
+    except Exception:
+        pass
+    _hwmon_avail = avail
+    return avail
+
+
 def _read_cpu_temp_win():
+    if not _hwmon_available():
+        return None
     for ns in ("root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor"):
         try:
             script = (
@@ -327,65 +394,240 @@ def _read_cpu_temp_linux():
     return None
 
 
-def display_tokens(disp=None):
-    if disp is None:
-        disp = _state["display"]
+LEGACY_DISPLAY_KEYS = [
+    ("cpu", "C"), ("ram", "R"), ("cpu_freq", "F"),
+    ("gpu", "G"), ("gpu_temp", "T"), ("gpu_freq", "M"), ("cpu_temp", "c"),
+]
+
+
+def default_page():
+    cells = []
+    for i, (key, label) in enumerate(LEGACY_DISPLAY_KEYS):
+        if key == "cpu_temp":
+            continue
+        cells.append({"key": key, "x": (0, 5, 11)[i % 3], "y": i // 3,
+                      "label": label})
+    return {"name": "Page 1", "delay": None, "cells": cells}
+
+
+def _to_int(v, dflt):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return dflt
+
+
+def _to_float(v, dflt):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return dflt
+
+
+def build_display_pages(disp):
+    if not isinstance(disp, dict):
+        disp = {}
+    pages = disp.get("pages")
+    if isinstance(pages, list) and pages:
+        out = []
+        for p in pages:
+            if not isinstance(p, dict):
+                continue
+            cells = []
+            for c in p.get("cells", []) if isinstance(p.get("cells"), list) else []:
+                if not isinstance(c, dict):
+                    continue
+                key = str(c.get("key") or "").strip()
+                if key not in RENDER_TARGETS:
+                    continue
+                cells.append({
+                    "key": key,
+                    "x": max(0, min(15, _to_int(c.get("x"), 0))),
+                    "y": 1 if _to_int(c.get("y"), 0) > 0 else 0,
+                    "label": str(c.get("label") or ""),
+                })
+            if not cells:
+                continue
+            name = str(p.get("name") or "").strip() or "Page %d" % (len(out) + 1)
+            delay = _to_float(p.get("delay"), None)
+            out.append({"name": name, "delay": delay, "cells": cells})
+        if out:
+            return {"page_delay": _to_float(disp.get("page_delay"),
+                                            DEFAULT_DISPLAY["page_delay"]),
+                    "pages": out}
+    cells = []
+    i = 0
+    for key, label in LEGACY_DISPLAY_KEYS:
+        if disp.get(key, False):
+            y = i // 3
+            if y > 1:
+                log("display: %s does not fit the 16x2 grid, skipped" % key)
+                i += 1
+                continue
+            cells.append({"key": key, "x": (0, 5, 11)[i % 3], "y": y,
+                          "label": label})
+            i += 1
+    if not cells:
+        cells = default_page()["cells"]
+    return {"page_delay": DEFAULT_DISPLAY["page_delay"],
+            "pages": [{"name": "Page 1", "delay": None, "cells": cells}]}
+
+
+def _fmt_cpu():
     with _state["lock"]:
-        cpu = _state["cpu"]
-        ram = _state["ram_gb"]
+        return "%d%%" % int(round(_state["cpu"]))
+
+
+def _fmt_ram():
+    with _state["lock"]:
+        return "%.1fG" % _state["ram_gb"]
+
+
+def _fmt_cpu_freq():
+    with _state["lock"]:
         cf = _state["cpu_freq"]
-        gpu = _state["gpu"]
-        gt = _state["gtemp"]
-        gf = _state["gpu_freq"]
-        ct = _state["ctemp"]
-    tokens = []
-    if disp.get("cpu", True):
-        tokens.append("C%d%%" % int(round(cpu)))
-    if disp.get("ram", True):
-        tokens.append("R%.1fG" % ram)
-    if disp.get("cpu_freq", True):
-        tokens.append(("%.1fG" % (cf / 1000.0)) if cf else "NAG")
-    if disp.get("gpu", True):
-        tokens.append(("G%d%%" % int(round(gpu))) if gpu is not None else "GNA")
-    if disp.get("gpu_temp", True):
-        tokens.append(("%dC" % int(round(gt))) if gt is not None else "NAC")
-    if disp.get("gpu_freq", True):
-        tokens.append(("%dM" % gf) if gf else "NAM")
-    if disp.get("cpu_temp", True):
-        tokens.append(("%dC" % int(round(ct))) if ct is not None else "NAC")
-    return tokens
+    return ("%.1fG" % (cf / 1000.0)) if cf else "NA"
 
 
-def pack_rows(tokens):
-    rows = ["", ""]
-    r = 0
-    for t in tokens:
-        t = t[:16]
-        if r == 0:
-            cand = (rows[0] + " " + t).strip() if rows[0] else t
-            if len(cand) <= 16:
-                rows[0] = cand
-            else:
-                r = 1
-                rows[1] = t if len(t) <= 15 else t[:15]
-        else:
-            cand = rows[1] + " " + t if rows[1] else t
-            if len(cand) <= 15:
-                rows[1] = cand
-            else:
-                if not rows[1]:
-                    rows[1] = t[:15]
-    return rows
+def _fmt_gpu():
+    with _state["lock"]:
+        g = _state["gpu"]
+    return ("%d%%" % int(round(g))) if g is not None else "NA"
+
+
+def _fmt_gpu_temp():
+    with _state["lock"]:
+        t = _state["gtemp"]
+    return ("%dC" % int(round(t))) if t is not None else "NA"
+
+
+def _fmt_gpu_freq():
+    with _state["lock"]:
+        f = _state["gpu_freq"]
+    return ("%dM" % f) if f else "NA"
+
+
+def _fmt_cpu_temp():
+    with _state["lock"]:
+        t = _state["ctemp"]
+    return ("%dC" % int(round(t))) if t is not None else "NA"
+
+
+def _fmt_ip():
+    with _state["lock"]:
+        ip = _state.get("ip")
+    return ip or "NA"
+
+
+def _fmt_procs():
+    with _state["lock"]:
+        return "%d" % _state.get("procs", 0)
+
+
+def _fmt_net_tx():
+    with _state["lock"]:
+        return "%.1fM" % _state.get("net_tx", 0.0)
+
+
+def _fmt_net_rx():
+    with _state["lock"]:
+        return "%.1fM" % _state.get("net_rx", 0.0)
+
+
+RENDER_TARGETS = {
+    "cpu": _fmt_cpu,
+    "ram": _fmt_ram,
+    "cpu_freq": _fmt_cpu_freq,
+    "gpu": _fmt_gpu,
+    "gpu_temp": _fmt_gpu_temp,
+    "gpu_freq": _fmt_gpu_freq,
+    "cpu_temp": _fmt_cpu_temp,
+    "ip": _fmt_ip,
+    "procs": _fmt_procs,
+    "net_tx": _fmt_net_tx,
+    "net_rx": _fmt_net_rx,
+}
+
+
+def render_page(page):
+    rows = [[" "] * 16, [" "] * 16]
+    if not isinstance(page, dict):
+        return ["", ""]
+    for cell in page.get("cells", []) if isinstance(page.get("cells"), list) else []:
+        if not isinstance(cell, dict):
+            continue
+        fmt = RENDER_TARGETS.get(cell.get("key"))
+        if fmt is None:
+            continue
+        text = str(cell.get("label") or "") + fmt()
+        if not text:
+            continue
+        x = max(0, min(15, _to_int(cell.get("x"), 0)))
+        y = 1 if _to_int(cell.get("y"), 0) > 0 else 0
+        for ch in text:
+            if x > 15:
+                break
+            rows[y][x] = ch
+            x += 1
+    return ["".join(r).rstrip() for r in rows]
 
 
 def build_line():
-    rows = pack_rows(display_tokens())
+    pages = _state["display"].get("pages")
+    page = (pages or [default_page()])[0]
+    rows = render_page(page)
     return "D:" + rows[0] + "|" + rows[1]
+
+
+def read_ip():
+    try:
+        for _name, addrs in psutil.net_if_addrs().items():
+            for a in addrs:
+                if a.family == socket.AF_INET:
+                    ip = a.address
+                    if (ip.startswith("127.") or ip.startswith("169.254.")
+                            or ip.startswith("0.")):
+                        continue
+                    return ip
+    except Exception:
+        pass
+    return None
+
+
+def _page_keys():
+    keys = set()
+    for p in _state["display"].get("pages", []):
+        if not isinstance(p, dict):
+            continue
+        for c in p.get("cells", []) if isinstance(p.get("cells"), list) else []:
+            if isinstance(c, dict) and c.get("key"):
+                keys.add(c.get("key"))
+    return keys
+
+
+def _needs_gpu():
+    return GPU_BIN is not None and bool(_page_keys() & {"gpu", "gpu_temp", "gpu_freq"})
+
+
+def _needs_ctemp():
+    return "cpu_temp" in _page_keys()
+
+
+def _needs_net():
+    return bool(_page_keys() & {"net_tx", "net_rx"})
+
+
+def _needs_ip():
+    return "ip" in _page_keys()
 
 
 def sampler_loop():
     psutil.cpu_percent(None)
     last_gpu = 0.0
+    last_ctemp = 0.0
+    last_ip = 0.0
+    net_prev = None
+    net_prev_t = 0.0
     while _state["running"]:
         try:
             cpu = psutil.cpu_percent(interval=0.8)
@@ -396,15 +638,38 @@ def sampler_loop():
                 _state["cpu"] = cpu
                 _state["ram_gb"] = vm.used / 1073741824.0
                 _state["cpu_freq"] = cf_mhz
+                _state["procs"] = len(psutil.pids())
             now = time.time()
-            if now - last_gpu >= 2.5:
+            if _needs_net():
+                cur = psutil.net_io_counters()
+                if net_prev is not None:
+                    dt = max(now - net_prev_t, 0.001)
+                    with _state["lock"]:
+                        _state["net_tx"] = ((cur.bytes_sent - net_prev.bytes_sent)
+                                            / dt / 1048576.0)
+                        _state["net_rx"] = ((cur.bytes_recv - net_prev.bytes_recv)
+                                            / dt / 1048576.0)
+                net_prev = cur
+                net_prev_t = now
+            else:
+                net_prev = None
+            if _needs_ip() and now - last_ip >= 30.0:
+                last_ip = now
+                with _state["lock"]:
+                    _state["ip"] = read_ip()
+            if not _state["connected"]:
+                continue
+            if now - last_gpu >= _state["delays"]["gpu"] and _needs_gpu():
                 last_gpu = now
                 gpu, gtemp, gfreq = read_gpu()
-                ctemp = read_cpu_temp()
                 with _state["lock"]:
                     _state["gpu"] = gpu
                     _state["gtemp"] = gtemp
                     _state["gpu_freq"] = gfreq
+            if now - last_ctemp >= _state["delays"]["ctemp"] and _needs_ctemp():
+                last_ctemp = now
+                ctemp = read_cpu_temp()
+                with _state["lock"]:
                     _state["ctemp"] = ctemp
         except Exception as e:
             log("sampler: %s" % e)
@@ -413,13 +678,26 @@ def sampler_loop():
 
 def worker_loop():
     tick = 0
+    page_idx = 0
+    last_switch = time.time()
     while _state["running"]:
         try:
-            with _state["lock"]:
-                cpu = _state["cpu"]
-            line = build_line()
+            disp = _state["display"]
+            pages = disp.get("pages")
+            if not pages:
+                pages = [default_page()]
+            page = pages[page_idx % len(pages)]
+            pd = page.get("delay") or disp.get("page_delay", 5.0)
+            if time.time() - last_switch >= pd:
+                page_idx += 1
+                last_switch = time.time()
+                page = pages[page_idx % len(pages)]
+            rows = render_page(page)
+            line = "D:" + rows[0] + "|" + rows[1]
             _state["last_line"] = line
             send_line(line)
+            with _state["lock"]:
+                cpu = _state["cpu"]
             send_line("X:%d" % int(round(cpu)))
             tick += 1
             if tick % 5 == 0:
@@ -537,9 +815,11 @@ def classify_window(title, cls, is_dialog, wtype=""):
 
 
 def send_alert(pattern, use_led):
-    if pattern != "off" and use_led:
+    if pattern in NO_SOUND:
+        return
+    if use_led:
         send_line("A:" + pattern)
-    elif pattern != "off":
+    else:
         send_line("B:" + pattern)
 
 
@@ -558,15 +838,21 @@ def _detect_linux_window_backend():
     return _LINUX_WIN_BACKEND
 
 
+_XLIB_DISP = None
+
+
 def _xlib_list_windows():
+    global _XLIB_DISP
     try:
         from Xlib import X, display
     except Exception:
         return []
-    try:
-        d = display.Display()
-    except Exception:
-        return []
+    if _XLIB_DISP is None:
+        try:
+            _XLIB_DISP = display.Display()
+        except Exception:
+            return []
+    d = _XLIB_DISP
     res = []
     try:
         root = d.screen().root
@@ -634,12 +920,8 @@ def _xlib_list_windows():
                 walk(c)
         walk(root)
     except Exception:
-        pass
-    finally:
-        try:
-            d.close()
-        except Exception:
-            pass
+        _XLIB_DISP = None
+        return []
     return res
 
 
@@ -683,12 +965,19 @@ def _linux_list_windows():
     return []
 
 
+NO_TITLE_CLASSES = ("tooltips_class32", "#32768", "IME", "MSCTFIME UI",
+                    "Progman", "Shell_TrayWnd", "DummyDWMListenerWindow",
+                    "EdgeUiInputTopWndClass", "Windows.UI.Core.CoreWindow")
+
+
 def iter_windows():
     if IS_WINDOWS:
         for hwnd in enum_windows():
+            cls = win_class(hwnd)
+            if cls in NO_TITLE_CLASSES:
+                continue
             pid = win_pid(hwnd)
             title = win_title(hwnd)
-            cls = win_class(hwnd)
             yield {"id": hwnd, "pid": pid, "title": title, "cls": cls,
                    "dialog": is_dialog_like(hwnd, cls, title), "wtype": ""}
     else:
@@ -699,30 +988,48 @@ def iter_windows():
 def alert_loop():
     prev = set()
     warned = False
+    was_connected = False
     while _state["running"]:
         try:
+            delays = _state["delays"]
+            if not _state["connected"]:
+                prev = set()
+                was_connected = False
+                time.sleep(max(3.0, delays["windows"] + 1.0))
+                continue
             buz = _state["buzzer"]
             if not buz.get("watch", True):
                 prev = set()
-                time.sleep(1.0)
+                was_connected = False
+                time.sleep(delays["windows"])
                 continue
             if not IS_WINDOWS and not warned:
                 if _detect_linux_window_backend() is None:
                     log("window monitor: X11/xdotool not available, window alerts off")
                 warned = True
             own = _state["self_pid"]
+            ignored = [s.lower() for s in _state.get("ignored", [])]
             cur = {}
             for w in iter_windows():
                 if w.get("pid") == own:
                     continue
-                kind = classify_window(w.get("title", ""), w.get("cls", ""),
+                title = w.get("title", "") or ""
+                low = title.lower()
+                if any(s in low for s in ignored):
+                    continue
+                kind = classify_window(title, w.get("cls", ""),
                                        w.get("dialog", False), w.get("wtype", ""))
                 if kind is not None:
-                    cur[w["id"]] = (kind, w.get("title", ""))
+                    cur[w["id"]] = (kind, title)
+            if not was_connected:
+                prev = set(cur)
+                was_connected = True
+                time.sleep(delays["windows"])
+                continue
             new = {k: v for k, v in cur.items() if k not in prev}
             if new:
                 now = time.time()
-                if now - _state["last_alert"] >= 2.0:
+                if now - _state["last_alert"] >= delays["alert_min"]:
                     _state["last_alert"] = now
                     wid = min(new)
                     kind, title = new[wid]
@@ -738,7 +1045,7 @@ def alert_loop():
             prev = set(cur)
         except Exception as e:
             log("alert: %s" % e)
-        time.sleep(0.5)
+        time.sleep(_state["delays"]["windows"])
 
 
 if IS_WINDOWS:
@@ -830,9 +1137,14 @@ def usb_monitor_loop():
     prev = None
     while _state["running"]:
         try:
+            dly = _state["delays"]["usb"]
+            if not _state["connected"]:
+                prev = None
+                time.sleep(dly)
+                continue
             cur = list_usb_device_ids()
             if cur is None:
-                time.sleep(1.5)
+                time.sleep(dly)
                 continue
             if prev is not None:
                 usb = _state.get("usb", DEFAULT_USB)
@@ -841,17 +1153,100 @@ def usb_monitor_loop():
                 if added:
                     log("usb added: %s" % sorted(added)[0])
                     pat = usb.get("connect", "chime_up")
-                    if usb.get("sound", True) and pat != "off":
+                    if usb.get("sound", True) and pat not in NO_SOUND:
                         send_alert(pat, False)
                 if removed:
                     log("usb removed: %s" % sorted(removed)[0])
                     pat = usb.get("disconnect", "chime_down")
-                    if usb.get("sound", True) and pat != "off":
+                    if usb.get("sound", True) and pat not in NO_SOUND:
                         send_alert(pat, False)
             prev = cur
         except Exception as e:
             log("usb: %s" % e)
-        time.sleep(1.5)
+        time.sleep(_state["delays"]["usb"])
+
+
+def _win_list_sata_disks():
+    try:
+        script = (
+            "Get-CimInstance Win32_DiskDrive | "
+            "Where-Object { $_.InterfaceType -eq 'SATA' } | "
+            "ForEach-Object { $_.Model + '|' + $_.SerialNumber }"
+        )
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=6, **_subprocess_kw())
+        ids = set()
+        for line in (p.stdout or "").splitlines():
+            line = line.strip()
+            if line:
+                ids.add(line)
+        return ids
+    except Exception:
+        return None
+
+
+def _linux_list_sata_disks():
+    ids = set()
+    try:
+        for name in os.listdir("/sys/block"):
+            if not (name.startswith("sd") or name.startswith("hd")):
+                continue
+            try:
+                with open(os.path.join("/sys/block", name, "removable")) as f:
+                    if f.read().strip() != "0":
+                        continue
+            except Exception:
+                continue
+            model = ""
+            try:
+                with open(os.path.join("/sys/block", name, "device", "model")) as f:
+                    model = f.read().strip()
+            except Exception:
+                pass
+            ids.add("%s|%s" % (name, model))
+    except Exception:
+        return None
+    return ids
+
+
+def list_sata_disks():
+    if IS_WINDOWS:
+        return _win_list_sata_disks()
+    return _linux_list_sata_disks()
+
+
+def disk_monitor_loop():
+    prev = None
+    while _state["running"]:
+        try:
+            dly = _state["delays"]["disks"]
+            if not _state["connected"]:
+                prev = None
+                time.sleep(dly)
+                continue
+            cur = list_sata_disks()
+            if cur is None:
+                time.sleep(dly)
+                continue
+            if prev is not None:
+                disks = _state.get("disks", DEFAULT_DISKS)
+                added = cur - prev
+                removed = prev - cur
+                if added:
+                    log("sata added: %s" % sorted(added)[0])
+                    pat = disks.get("connect", "chime_up")
+                    if disks.get("sound", True) and pat not in NO_SOUND:
+                        send_alert(pat, False)
+                if removed:
+                    log("sata removed: %s" % sorted(removed)[0])
+                    pat = disks.get("disconnect", "chime_down")
+                    if disks.get("sound", True) and pat not in NO_SOUND:
+                        send_alert(pat, False)
+            prev = cur
+        except Exception as e:
+            log("disks: %s" % e)
+        time.sleep(_state["delays"]["disks"])
 
 
 def make_icon_image():
@@ -1002,12 +1397,43 @@ def _settings_thread():
         log("settings: tkinter unavailable: %s" % e)
         return
     buz = dict(_state["buzzer"])
-    disp = dict(_state["display"])
+    disp_cfg = build_display_pages(dict(_state["display"]))
+    pages = disp_cfg["pages"]
     root = tk.Tk()
     root.title(APP_NAME + " - Settings")
     root.resizable(False, False)
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+    preview_canvases = []
+    preview_cur = {"page": pages[0] if pages else default_page()}
+
+    def make_preview_canvas(parent):
+        c = tk.Canvas(parent, width=284, height=64, bg="#0b0f0d",
+                      highlightthickness=0)
+        preview_canvases.append(c)
+        return c
+
+    def draw_preview(canv, rows):
+        canv.delete("all")
+        pad = 12
+        cw, ch = 17, 22
+        canv.create_rectangle(0, 0, pad * 2 + 16 * cw,
+                              pad * 2 + 2 * (ch + 4),
+                              fill="#111", outline="")
+        for r in range(2):
+            line = rows[r] if r < len(rows) else ""
+            for x in range(16):
+                chch = line[x] if x < len(line) else " "
+                x0 = pad + x * cw
+                y0 = pad + r * (ch + 4)
+                on = chch != " "
+                canv.create_rectangle(x0, y0, x0 + cw, y0 + ch,
+                                      fill="#2c9f5a" if on else "#1a3327",
+                                      outline="#0a2415")
+                if on:
+                    canv.create_text(x0 + cw // 2, y0 + ch // 2, text=chch,
+                                     fill="#06230f", font=("Courier New", 10, "bold"))
 
     f1 = ttk.Frame(nb, padding=8)
     nb.add(f1, text="Connection")
@@ -1019,13 +1445,13 @@ def _settings_thread():
                  width=16, state="readonly").grid(row=0, column=1, padx=4, pady=4)
     tk.Label(f1, text="Update interval (s):").grid(row=1, column=0, sticky="w", padx=4, pady=4)
     tk.Entry(f1, textvariable=var_int, width=18).grid(row=1, column=1, padx=4, pady=4)
+    ttk.Separator(f1, orient="horizontal").grid(
+        row=3, column=0, columnspan=2, sticky="we", padx=4, pady=(10, 2))
+    make_preview_canvas(f1).grid(row=4, column=0, columnspan=2, sticky="w", padx=4, pady=4)
 
     f2 = ttk.Frame(nb, padding=8)
     nb.add(f2, text="Notifications")
-    patterns = ["off", "short", "long", "double", "triple", "rapid",
-                "chime_up", "chime_down", "siren", "wake"]
-    AUDIBLE_PATTERNS = ["short", "long", "double", "triple", "rapid",
-                        "chime_up", "chime_down", "siren", "wake"]
+    patterns = SOUND_PATTERNS
     var_watch = tk.BooleanVar(value=buz["watch"])
     var_buz = tk.BooleanVar(value=buz["enabled"])
     var_led = tk.BooleanVar(value=buz["led"])
@@ -1094,7 +1520,7 @@ def _settings_thread():
             _state["buzzer"] = b
             send_buzzer_config()
             _state["buzzer"] = old
-            if b["enabled"] and pattern != "off":
+            if b["enabled"] and pattern not in NO_SOUND:
                 if b["led"]:
                     send_line("A:" + pattern)
                 else:
@@ -1110,34 +1536,266 @@ def _settings_thread():
                    command=make_test(pat)).grid(
             row=idx // 3, column=idx % 3, padx=2, pady=2)
 
+    r += 1
+    tk.Label(f2, text="Ignore titles (no alert):").grid(
+        row=r, column=0, columnspan=4, sticky="w", padx=4, pady=(10, 0))
+    r += 1
+    fign = ttk.Frame(f2)
+    fign.grid(row=r, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+    var_ign_entry = tk.StringVar()
+    list_ign = tk.Listbox(fign, width=32, height=5)
+    list_ign.grid(row=1, column=0, rowspan=2, padx=(0, 4))
+    entry_ign = tk.Entry(fign, textvariable=var_ign_entry, width=32)
+    entry_ign.grid(row=0, column=0, padx=(0, 4), sticky="we")
+    ttk.Button(fign, text="Add", width=8,
+               command=lambda: _add_ignore()).grid(row=0, column=1, pady=(0, 2))
+    ttk.Button(fign, text="Remove", width=8,
+               command=lambda: _remove_ignore()).grid(row=1, column=1)
+
+    def _add_ignore():
+        t = var_ign_entry.get().strip()
+        low = t.lower()
+        if t and not any(low == x.lower() for x in list_ign.get(0, "end")):
+            list_ign.insert("end", t)
+        var_ign_entry.set("")
+
+    def _remove_ignore():
+        sel = list_ign.curselection()
+        if sel:
+            list_ign.delete(sel[0])
+
+    for t in _state.get("ignored", []):
+        list_ign.insert("end", t)
+
+    r += 1
+    ttk.Separator(f2, orient="horizontal").grid(
+        row=r, column=0, columnspan=4, sticky="we", padx=4, pady=(10, 2))
+    r += 1
+    make_preview_canvas(f2).grid(row=r, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+
     f3 = ttk.Frame(nb, padding=8)
     nb.add(f3, text="Display")
-    fields = [
-        ("cpu", "CPU load"),
-        ("cpu_freq", "CPU frequency"),
-        ("ram", "RAM used"),
-        ("gpu", "GPU load"),
-        ("gpu_temp", "GPU temperature"),
-        ("gpu_freq", "GPU frequency"),
-        ("cpu_temp", "CPU temperature"),
-    ]
-    disp_vars = {}
+    keys = sorted(RENDER_TARGETS.keys())
 
-    def update_preview():
-        cand = {k: v.get() for k, v in disp_vars.items()}
-        rows = pack_rows(display_tokens(cand))
-        var_preview.set(rows[0] + "\n" + rows[1])
+    def refresh_previews():
+        page = preview_cur["page"]
+        rows = render_page(page)
+        for canv in preview_canvases:
+            draw_preview(canv, rows)
 
-    for i, (key, label) in enumerate(fields):
-        v = tk.BooleanVar(value=disp.get(key, False))
-        disp_vars[key] = v
-        ttk.Checkbutton(f3, text=label, variable=v,
-                        command=update_preview).grid(
-            row=i, column=0, sticky="w", padx=4, pady=2)
-    var_preview = tk.StringVar()
-    tk.Label(f3, textvariable=var_preview, font=("Courier New", 13), justify="left").grid(
-        row=len(fields), column=0, sticky="w", padx=4, pady=8)
-    update_preview()
+    var_page_delay = tk.StringVar(value=str(disp_cfg.get("page_delay", 5.0)))
+    var_page_delay.trace_add("write", lambda *a: refresh_previews())
+
+    def load_page():
+        sel = list_pages.curselection()
+        if not sel:
+            return
+        p = pages[sel[0]]
+        preview_cur["page"] = p
+        var_page_name.set(p.get("name") or "")
+        var_page_delay_per.set(str(p.get("delay") or "") if p.get("delay") else "")
+        tree_cells.delete(*tree_cells.get_children())
+        for i, c in enumerate(p.get("cells", [])):
+            tree_cells.insert("", "end", iid=str(i), values=(
+                c.get("label") or "", c.get("key") or "",
+                c.get("x", 0), c.get("y", 0)))
+        tree_cells.selection_remove(*tree_cells.get_children())
+        refresh_previews()
+
+    def add_page():
+        new_page = {"name": "Page %d" % (len(pages) + 1), "delay": None, "cells": []}
+        pages.append(new_page)
+        list_pages.insert("end", new_page["name"])
+        list_pages.selection_clear(0, "end")
+        list_pages.selection_set("end")
+        list_pages.activate("end")
+        load_page()
+
+    def del_page():
+        sel = list_pages.curselection()
+        if not sel:
+            return
+        if len(pages) <= 1:
+            pages[0]["cells"] = []
+            pages[0]["name"] = "Page 1"
+            var_page_name.set("Page 1")
+            var_page_delay_per.set("")
+            refresh_previews()
+            load_page()
+            return
+        idx = sel[0]
+        pages.pop(idx)
+        list_pages.delete(idx)
+        n = len(pages)
+        nsel = min(idx, n - 1)
+        list_pages.selection_clear(0, "end")
+        list_pages.selection_set(nsel)
+        list_pages.activate(nsel)
+        load_page()
+
+    def load_cell():
+        sel = tree_cells.selection()
+        if not sel:
+            return
+        i = int(sel[0])
+        c = preview_cur["page"]["cells"][i]
+        var_cell_key.set(c.get("key") or "")
+        var_cell_label.set(c.get("label") or "")
+        var_cell_x.set(str(c.get("x", 0)))
+        var_cell_y.set(str(c.get("y", 0)))
+
+    def cell_from_fields():
+        key = var_cell_key.get()
+        if key not in RENDER_TARGETS:
+            key = keys[0]
+        try:
+            x = max(0, min(15, int(var_cell_x.get())))
+        except ValueError:
+            x = 0
+        try:
+            y = 1 if int(var_cell_y.get()) > 0 else 0
+        except ValueError:
+            y = 0
+        return {"key": key, "x": x, "y": y, "label": var_cell_label.get()}
+
+    def add_cell():
+        p = preview_cur["page"]
+        p["cells"].append(cell_from_fields())
+        load_page()
+        i = len(p["cells"]) - 1
+        tree_cells.see(str(i))
+        tree_cells.selection_set(str(i))
+
+    def update_cell():
+        sel = tree_cells.selection()
+        cell = cell_from_fields()
+        if sel:
+            i = int(sel[0])
+            p = preview_cur["page"]
+            if i < len(p["cells"]):
+                p["cells"][i] = cell
+                load_page()
+                tree_cells.selection_set(sel[0])
+                return
+        p = preview_cur["page"]
+        p["cells"].append(cell)
+        load_page()
+        i = len(p["cells"]) - 1
+        tree_cells.see(str(i))
+        tree_cells.selection_set(str(i))
+
+    def remove_cell():
+        sel = tree_cells.selection()
+        if not sel:
+            return
+        i = int(sel[0])
+        p = preview_cur["page"]
+        if i < len(p["cells"]):
+            p["cells"].pop(i)
+            load_page()
+
+    r = 0
+    tk.Label(f3, text="Default page delay (s):").grid(
+        row=r, column=0, sticky="w", padx=4, pady=4)
+    tk.Entry(f3, textvariable=var_page_delay, width=8).grid(
+        row=r, column=1, sticky="w", padx=4, pady=4)
+    r += 1
+    tk.Label(f3, text="Pages:").grid(
+        row=r, column=0, sticky="nw", padx=4, pady=(8, 0))
+    list_pages = tk.Listbox(f3, width=22, height=4)
+    list_pages.grid(row=r, column=1, sticky="w", padx=4, pady=(8, 0))
+    for p in pages:
+        list_pages.insert("end", p.get("name") or "Page")
+    ttk.Button(f3, text="Add page", command=add_page).grid(
+        row=r, column=2, sticky="w", padx=2, pady=2)
+    ttk.Button(f3, text="Delete", command=del_page).grid(
+        row=r, column=3, sticky="w", padx=2, pady=2)
+    list_pages.bind("<<ListboxSelect>>", lambda e: load_page())
+    r += 1
+    var_page_name = tk.StringVar()
+    var_page_delay_per = tk.StringVar()
+    tk.Label(f3, text="Name:").grid(
+        row=r, column=0, sticky="w", padx=4, pady=4)
+    tk.Entry(f3, textvariable=var_page_name, width=16).grid(
+        row=r, column=1, sticky="w", padx=4, pady=4)
+    tk.Label(f3, text="Page delay (s):").grid(
+        row=r, column=2, sticky="w", padx=4, pady=4)
+    tk.Entry(f3, textvariable=var_page_delay_per, width=8).grid(
+        row=r, column=3, sticky="w", padx=4, pady=4)
+    var_page_name.trace_add("write", lambda *a: _apply_page_meta())
+    var_page_delay_per.trace_add("write", lambda *a: _apply_page_meta())
+
+    def _apply_page_meta():
+        p = preview_cur["page"]
+        p["name"] = var_page_name.get().strip()
+        raw = var_page_delay_per.get().strip()
+        try:
+            p["delay"] = max(float(raw), 0.1) if raw else None
+        except ValueError:
+            p["delay"] = None
+        try:
+            idx = list_pages.curselection()[0]
+            list_pages.delete(idx)
+            list_pages.insert(idx, p["name"] or "Page")
+            list_pages.selection_set(idx)
+        except (IndexError, tk.TclError):
+            pass
+
+    r += 1
+    ttk.Separator(f3, orient="horizontal").grid(
+        row=r, column=0, columnspan=4, sticky="we", padx=4, pady=(10, 2))
+    r += 1
+    tk.Label(f3, text="Cells (label, key, col, row):").grid(
+        row=r, column=0, columnspan=4, sticky="w", padx=4, pady=(6, 0))
+    r += 1
+    tree_cells = ttk.Treeview(f3, columns=("label", "key", "x", "y"),
+                              show="headings", height=6)
+    tree_cells.heading("label", text="Label")
+    tree_cells.heading("key", text="Key")
+    tree_cells.heading("x", text="Col")
+    tree_cells.heading("y", text="Row")
+    tree_cells.column("label", width=60)
+    tree_cells.column("key", width=80)
+    tree_cells.column("x", width=36, anchor="center")
+    tree_cells.column("y", width=36, anchor="center")
+    tree_cells.grid(row=r, column=0, columnspan=3, sticky="we", padx=4, pady=4)
+    scroll_cells = ttk.Scrollbar(f3, orient="vertical", command=tree_cells.yview)
+    scroll_cells.grid(row=r, column=3, sticky="ns", pady=4)
+    tree_cells.configure(yscrollcommand=scroll_cells.set)
+    tree_cells.bind("<<TreeviewSelect>>", lambda e: load_cell())
+    r += 1
+    tk.Label(f3, text="Key").grid(row=r, column=0, sticky="w", padx=4, pady=(6, 0))
+    tk.Label(f3, text="Label").grid(row=r, column=1, sticky="w", padx=4, pady=(6, 0))
+    tk.Label(f3, text="Col").grid(row=r, column=2, sticky="w", padx=4, pady=(6, 0))
+    tk.Label(f3, text="Row").grid(row=r, column=3, sticky="w", padx=4, pady=(6, 0))
+    r += 1
+    var_cell_key = tk.StringVar(value=keys[0])
+    var_cell_label = tk.StringVar()
+    var_cell_x = tk.StringVar(value="0")
+    var_cell_y = tk.StringVar(value="0")
+    ttk.Combobox(f3, textvariable=var_cell_key, values=keys, width=14,
+                 state="readonly").grid(row=r, column=0, sticky="w", padx=4, pady=4)
+    tk.Entry(f3, textvariable=var_cell_label, width=10).grid(
+        row=r, column=1, sticky="w", padx=4, pady=4)
+    tk.Entry(f3, textvariable=var_cell_x, width=4).grid(
+        row=r, column=2, sticky="w", padx=4, pady=4)
+    tk.Entry(f3, textvariable=var_cell_y, width=4).grid(
+        row=r, column=3, sticky="w", padx=4, pady=4)
+    r += 1
+    ttk.Button(f3, text="Add", width=8, command=add_cell).grid(
+        row=r, column=0, sticky="w", padx=2, pady=2)
+    ttk.Button(f3, text="Update", width=8, command=update_cell).grid(
+        row=r, column=1, sticky="w", padx=2, pady=2)
+    ttk.Button(f3, text="Remove", width=8, command=remove_cell).grid(
+        row=r, column=2, sticky="w", padx=2, pady=2)
+    r += 1
+    ttk.Separator(f3, orient="horizontal").grid(
+        row=r, column=0, columnspan=4, sticky="we", padx=4, pady=(10, 2))
+    r += 1
+    make_preview_canvas(f3).grid(row=r, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+    if pages:
+        list_pages.selection_set(0)
+    load_page()
 
     f4 = ttk.Frame(nb, padding=8)
     nb.add(f4, text="USB")
@@ -1154,6 +1812,55 @@ def _settings_thread():
     tk.Label(f4, text="Disconnect:").grid(row=2, column=0, sticky="w", padx=4, pady=4)
     ttk.Combobox(f4, textvariable=var_usb_disc, values=patterns, width=10,
                  state="readonly").grid(row=2, column=1, sticky="w", padx=4, pady=4)
+    ttk.Separator(f4, orient="horizontal").grid(
+        row=3, column=0, columnspan=2, sticky="we", padx=4, pady=(10, 2))
+    make_preview_canvas(f4).grid(row=4, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+
+    f6 = ttk.Frame(nb, padding=8)
+    nb.add(f6, text="Disks")
+    disks_cfg = dict(_state.get("disks", DEFAULT_DISKS))
+    var_disk_sound = tk.BooleanVar(value=disks_cfg.get("sound", True))
+    var_disk_conn = tk.StringVar(value=disks_cfg.get("connect", "chime_up"))
+    var_disk_disc = tk.StringVar(value=disks_cfg.get("disconnect", "chime_down"))
+    ttk.Checkbutton(f6, text="Sound on SATA disk connect/disconnect",
+                    variable=var_disk_sound).grid(
+        row=0, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+    tk.Label(f6, text="Connect:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+    ttk.Combobox(f6, textvariable=var_disk_conn, values=patterns, width=10,
+                 state="readonly").grid(row=1, column=1, sticky="w", padx=4, pady=4)
+    tk.Label(f6, text="Disconnect:").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+    ttk.Combobox(f6, textvariable=var_disk_disc, values=patterns, width=10,
+                 state="readonly").grid(row=2, column=1, sticky="w", padx=4, pady=4)
+    ttk.Separator(f6, orient="horizontal").grid(
+        row=3, column=0, columnspan=2, sticky="we", padx=4, pady=(10, 2))
+    make_preview_canvas(f6).grid(row=4, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+
+    f5 = ttk.Frame(nb, padding=8)
+    nb.add(f5, text="Delays")
+    delays_cfg = dict(_state.get("delays", DEFAULT_DELAYS))
+    delay_vars = {}
+    delay_fields = [
+        ("gpu", "GPU update interval (s):"),
+        ("ctemp", "CPU temp update interval (s):"),
+        ("windows", "Window monitor interval (s):"),
+        ("usb", "USB monitor interval (s):"),
+        ("disks", "SATA disk monitor interval (s):"),
+        ("retry", "Reconnect retry (s):"),
+        ("alert_min", "Min time between alerts (s):"),
+    ]
+    for i, (key, label) in enumerate(delay_fields):
+        tk.Label(f5, text=label).grid(row=i, column=0, sticky="w", padx=4, pady=4)
+        v = tk.StringVar(value=str(delays_cfg.get(key, DEFAULT_DELAYS[key])))
+        delay_vars[key] = v
+        tk.Entry(f5, textvariable=v, width=8).grid(
+            row=i, column=1, sticky="w", padx=4, pady=4)
+    ttk.Separator(f5, orient="horizontal").grid(
+        row=len(delay_fields), column=0, columnspan=2, sticky="we",
+        padx=4, pady=(10, 2))
+    make_preview_canvas(f5).grid(
+        row=len(delay_fields) + 1, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+
+    refresh_previews()
 
     def save():
         try:
@@ -1179,21 +1886,61 @@ def _settings_thread():
             "warning": var_warn.get(),
             "info": var_info.get(),
         }
-        disp_new = {k: v.get() for k, v in disp_vars.items()}
+        disp_pages = []
+        for p in pages:
+            cells = [c for c in p.get("cells", [])
+                     if c.get("key") in RENDER_TARGETS]
+            if not cells:
+                continue
+            disp_pages.append({
+                "name": (p.get("name") or "").strip() or "Page %d" % (len(disp_pages) + 1),
+                "delay": p.get("delay"),
+                "cells": cells,
+            })
+        if not disp_pages:
+            disp_pages = default_page()["cells"]
+            disp_new = {"page_delay": 5.0,
+                        "pages": [{"name": "Page 1", "delay": None,
+                                   "cells": disp_pages}]}
+        else:
+            try:
+                page_delay = max(float(var_page_delay.get()), 0.1)
+            except ValueError:
+                page_delay = 5.0
+            disp_new = {"page_delay": page_delay, "pages": disp_pages}
         usb_new = {
             "sound": var_usb_sound.get(),
             "connect": var_usb_conn.get(),
             "disconnect": var_usb_disc.get(),
         }
+        disks_new = {
+            "sound": var_disk_sound.get(),
+            "connect": var_disk_conn.get(),
+            "disconnect": var_disk_disc.get(),
+        }
+        delays_new = {}
+        for key, var in delay_vars.items():
+            try:
+                v = float(var.get())
+            except ValueError:
+                v = DEFAULT_DELAYS.get(key, 2.0)
+            delays_new[key] = max(v, 0.1)
+        ignored_new = [list_ign.get(i).strip()
+                       for i in range(list_ign.size())
+                       if list_ign.get(i).strip()]
         cfg = {"com_port": "" if var_port.get() == "auto" else var_port.get(),
                "interval": iv, "buzzer": buz_new, "display": disp_new,
-               "usb": usb_new}
+               "usb": usb_new, "disks": disks_new, "delays": delays_new,
+               "ignored": ignored_new}
         save_config(cfg)
         _state["com_port"] = cfg["com_port"]
         _state["interval"] = iv
         _state["buzzer"] = buz_new
         _state["display"] = disp_new
         _state["usb"] = usb_new
+        _state["disks"] = disks_new
+        _state["delays"] = delays_new
+        _state["ignored"] = ignored_new
         send_buzzer_config()
         root.destroy()
         force_reconnect()
@@ -1272,13 +2019,17 @@ def main():
     _state["com_port"] = cfg.get("com_port", "")
     _state["interval"] = float(cfg.get("interval", 1.0))
     _state["buzzer"] = dict(cfg.get("buzzer", DEFAULT_BUZZER))
-    _state["display"] = dict(cfg.get("display", DEFAULT_DISPLAY))
+    _state["display"] = build_display_pages(cfg.get("display"))
     _state["usb"] = dict(cfg.get("usb", DEFAULT_USB))
+    _state["disks"] = dict(cfg.get("disks", DEFAULT_DISKS))
+    _state["delays"] = dict(cfg.get("delays", DEFAULT_DELAYS))
+    _state["ignored"] = list(cfg.get("ignored", []))
 
     threading.Thread(target=sampler_loop, daemon=True).start()
     threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=alert_loop, daemon=True).start()
     threading.Thread(target=usb_monitor_loop, daemon=True).start()
+    threading.Thread(target=disk_monitor_loop, daemon=True).start()
 
     menu = pystray.Menu(
         pystray.MenuItem("Status", show_status),
